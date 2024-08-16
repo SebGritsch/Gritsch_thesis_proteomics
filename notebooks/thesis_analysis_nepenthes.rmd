@@ -1,0 +1,1937 @@
+---
+title: "Master's Thesis: Analysis of Nepenthes proteomic data"
+author: "Sebastian Gritsch"
+date: "2023-11-14"
+output:
+  pdf_document: default
+---
+
+```{r setup analysis, include=FALSE}
+knitr::opts_chunk$set(echo = T, eval = F, number_sections = F, strip.white = T, error= F, warning = F, message = F, attr.source = ".numberLines")
+```
+```{r initialize_project}
+here::i_am("./notebooks/thesis_analysis_nepenthes.rmd")
+```
+```{r load libraries, eval = TRUE}
+library(here)
+library(tidyverse)
+library(Biobase)
+library(magrittr)
+library(limma)
+library(pheatmap)
+library(ggfortify)
+library(EnhancedVolcano)
+```
+### Download contaminants database
+Download Cambridge Centre for Proteomics cRAP FASTA database (CCP cRAP)
+
+```{r download cRAP database, eval = FALSE}
+remotes::install_github("CambridgeCentreForProteomics/camprotR", dependencies = TRUE)
+library(camprotR); package.version('camprotR')
+download_ccp_crap(here("data", "prot_db", "raw_db_files",
+                       paste0(check_uniprot_release(), "_CCP_cRAP.fasta")),
+                  is_crap = TRUE, overwrite = FALSE, verbose = TRUE)
+```
+### Define colors
+Colors are based on color friendly palettes from Martin Krzywinski: Krzywinski, M. Designing for Color Blindess - Martin Krzywinski / Genome Sciences Center. <http://mkweb.bcgsc.ca/colorblind/index.mhtml#page-container>
+```{r define colors}
+colors <- list(
+  CONDITION = c("A" = "#9F0162", "B" = "#C7007C", "C" = "#FF5AAF", "D" = "#005FCC",
+                "E" = "#007702", "F" = "#EF0096", "G" = "#0079FA", "H" = "#009503",
+                "I" = "#00C2F9", "J" = "#00D302", "K" = "#00E5F8", "L" = "#00F407",
+                "M" = "#009FFA", "N" = "#00B408", "O" = "#7CFFFA", "P" = "#AFFF2A",
+                "Q" = "#FFCFE2"),
+  PLASTIC = c("PET" = "#00C2F9", "PBAT" = "#00F407", "no" = "#FF5AAF"),
+  JASMONATE = c("+" = "#FF9DC8", "-" = "#FFCFE2"),
+  WORM = c("dry" = "#CD022D", "live" = "#FF6E3A", "no" = "#FFDC3D"),
+  TIME = c("t0" = "#FFCCFE", "t1" = "#FF92FD", "t3" = "#8400CD", "t5" = "#450270")
+)
+
+# Color range for heatmaps for DE analysis
+# Define breaks for logFCo from -10 to 10 by 0.2
+breaks = seq(-10, 10, by = 0.2)
+colors_heatmap <- colorRampPalette(
+  rev(RColorBrewer::brewer.pal(n = 7,name = "RdYlBu")))(length(breaks))
+```
+### Function definitions
+
+```{r helper functions}
+# Function to get annotated data frame in long format
+join_long <- function(eset) {
+  exprs(eset) %>%
+  as.data.frame() %>%
+  pivot_longer(cols =everything(), names_to ="SAMPLEID", values_to ="value") %>%
+  left_join(., pData(eset), by = "SAMPLEID")
+}
+
+plot_mean_sd <- function(eset, main = NULL) {
+  # Create a mean vs. CV^2 plot with a loess trend line
+  # Code was adapted from the msImpute package
+  data <- exprs(eset) %>%
+    as.data.frame() %>%
+    rowwise() %>%
+    mutate(mean = mean(c_across(everything()), na.rm = TRUE),
+           CV = (sd(c_across(everything()), na.rm = TRUE)/mean)^2) %>%
+    ungroup()
+  
+  fit <- limma::loessFit(data$CV, data$mean)
+  data$fitted <- fit$fitted
+  
+  p <- ggplot(data, aes(x = mean, y = CV)) +
+    geom_point(size = 0.4) +
+    labs(x = "Average log-intensity", y = expression("CV"^2), title = main) +
+    geom_line(aes(y = fitted), color = "red", size = 0.75) +
+    theme_classic() +
+    theme(plot.title = element_text(size = 9),
+          axis.title = element_text(size = 9))
+  return(p)
+}
+
+plot_missing_values_heatmap <- function(eset){
+  # Set distance between column names and heatmap
+  ComplexHeatmap::ht_opt("COLUMN_ANNO_PADDING" = unit(0, "mm"))
+  # column annotation
+  col_annotation = eset %>%
+    exprs(.) %>%
+    colnames(.) %>%
+    str_extract(., "t[0-5]") %>%
+    ComplexHeatmap::HeatmapAnnotation(Time = .,
+                                      col = list(Time = colors$TIME),
+                                      simple_anno_size = unit(2, "mm"),
+                                      gp = grid::gpar(col = "black"),
+                                      show_annotation_name = FALSE,
+                                      annotation_legend_param = list(
+                                        nrow = 1,
+                                        title_position = "lefttop",
+                                        title_gp = grid::gpar(fontsize = 8),
+                                        labels_gp = grid::gpar(fontsize = 8),
+                                        grid_height = unit(3, "mm"),
+                                        grid_width = unit(3, "mm")))
+  
+  # Plot a heatmap of proteins with missing values
+  # code adapted from the plot_missval() function of the DEP package
+  heatmap <- eset %>%
+    exprs(.) %>%
+    data.frame(.) %>%
+    # convert missing values to 0 and valid values to 1
+    mutate_all(~ifelse(is.na(.), 0, 1)) %>%
+    # create a heatmap
+    ComplexHeatmap::Heatmap(col = c("white", "black"),
+            cluster_columns = FALSE,
+            column_names_side = "top",
+            show_row_names = FALSE,
+            top_annotation = col_annotation,
+            show_column_names = TRUE,
+            # Simplify column names
+            column_labels = str_replace(colnames(.), "^[NS]_", "") %>% 
+              str_replace("_t[0-5]_[0-3]", ""),
+            column_names_gp = grid::gpar(fontsize = 5),
+            column_names_centered = TRUE,
+            show_row_dend = FALSE,
+            name = "Value",
+            heatmap_legend_param = list(at = c(0, 1),
+                                        labels = c("Missing", "Observerd"),
+                                        title_position = "lefttop",
+                                        title_gp = grid::gpar(fontsize = 8),
+                                        labels_gp = grid::gpar(fontsize = 8),
+                                        grid_height = unit(3, "mm"),
+                                        grid_width = unit(3, "mm"),
+                                        border = "black",
+                                        nrow = 1),
+            border_gp = grid::gpar(col = "black", lwd = 1.5),
+            column_names_rot = 00) %>%  
+    # Draw heatmap
+    ComplexHeatmap::draw(heatmap_legend_side = "top",
+                         annotation_legend_side = "top") 
+    return(heatmap)
+}
+
+plot_heatmap <- function(toptable, annotation = NULL, FC = 0, title = NA,
+                         cluster_cols = TRUE, cluster_rows = TRUE, font = 8,
+                         treeheight_col = 30, treeheight_row = 30){
+  # make heatmap of top proteins
+  
+  # toptable: top table from limma
+  # annotation: vector with variables of metadata to include in the heatmap
+  # FC: fold change cutoff
+  # font: font size of the heatmap
+  # title: title of the heatmap
+  # cluster_cols: cluster columns; Boolean
+  # cluster_rows: cluster rows; Boolean
+  # treeheight_col: height of the column tree in points
+  # treeheight_row: height of the row tree in points
+  
+  # Create column annotation for heatmap
+  if (!is.null(annotation)){
+    col_annotation <- toptable %>%
+      select(matches("_vs_")) %>%
+      colnames() %>%
+      unique() %>%
+      data.frame(Contrast = .) %>%
+      mutate(TIME = str_extract(Contrast, "t[0-5]"),
+             CONDITION = str_extract(Contrast, "^[A-Z]")) %>%
+      # add condition metadata
+      left_join(metadata, by = c("CONDITION" = "CONDITION")) %>%
+      # convert true and false to + - for better visualization
+      mutate(JASMONATE = ifelse(JASMONATE, "+", "-")) %>%
+      select(Contrast, annotation) %>%
+      column_to_rownames("Contrast") 
+  } else {
+    col_annotation <- NA
+  }
+  
+  column_names <- toptable %>%
+    # select contrasts
+    select(matches("_vs_")) %>%
+    # replace "_" in column names with blank
+    colnames() %>%
+    str_replace_all("_vs_", " vs. ") %>%
+    str_remove_all("_t[0-5]")
+
+  plot <- toptable %>%
+    # select contrasts
+    select(matches("_vs_")) %>%
+    # remove row if all values are NA
+    filter(if_any(everything(), ~ !is.na(.))) %>%
+    # set NA to 0
+    mutate_all(~replace_na(., 0)) %>%
+    # filter for proteins with a logFC > FC in at least one contrast
+    filter(rowSums(abs(.) > FC) >0) %>%
+    # plot heatmap
+    pheatmap(scale = "none",
+             cluster_cols = cluster_cols,
+             cluster_rows = cluster_rows,
+             treeheight_col = treeheight_col,
+             treeheight_row = treeheight_row,
+             labels_col = column_names,
+             labels_row = toptable$Protein.ID,
+             show_rownames = FALSE,
+             # aesthetics
+             fontsize = font,
+             border_color = NA,
+             annotation_col = col_annotation,
+             annotation_colors = colors,
+             main = title,
+             color = colors_heatmap,
+             breaks = breaks)
+    return(plot)
+}
+
+count_deregulated_proteins <- function(toptable, FC = 0, sort = "up"){
+  # Create table with the number of deregulated proteins
+  
+  # toptable: top table from limma
+  # FC: fold change cutoff
+  # sort: "up" or "down" to sort by up- or downregulated proteins
+  
+  df <- toptable %>%
+    select(matches("_VS_", ignore.case = TRUE)) %>%
+    # count number of proteins that are up- and downregulated per contrast
+    rbind("up" = summarise_all(., ~sum(. > FC, na.rm = TRUE)),
+          "down" = summarise_all(., ~sum(. < -FC, na.rm = TRUE))) %>%
+    # only keep rows with the new metrics
+    filter(row.names(.) %in% c("up", "down")) %>%
+    # transpose for better readability
+    t() %>%
+    data.frame() %>%
+    # reorder columns
+    arrange(if (tolower(sort) == "down") desc(down) else desc(up))
+  return(df)
+}
+
+identify_deregulated_proteins <- function(toptable, FC = 0, DE = "up",
+                                          cutoff = 0, min_present = 20) {
+  # calculates the percentage of differential expression (either up or down)
+  # in the contrasts where the protein is present.
+  # Adds column "overexpressed" or "underexpressed" and sorts by the highest number
+  # Adds column "present" indicating the % of contrasts the protein is present in
+  
+  # toptable: top table from limma
+  # FC: fold change cutoff
+  # cutoff: cutoff for the % of contrasts in which a protein is overexpressed
+  # min_present: minimum % of contrasts a protein has to be present in
+  # DE: up or downregulated ["up", "down"]
+  
+  # Validate DE input
+  assertthat::assert_that(DE %in% c("up", "down"),
+                          msg = "DE must be either 'up' or 'down'")
+  
+  # Determine the direction of regulation
+  comparison <- if (DE == "up") function(x) x > FC else function(x) x < -FC
+  expression_column <- if (DE == "up") "overexpressed" else "underexpressed"
+  
+  num_contrasts <- length(grep("_vs_", colnames(toptable)))
+  
+  df <- toptable %>%
+    mutate(across(matches("_vs_"), ~ifelse(comparison(.), 1, 0))) %>%
+    mutate(
+      # Count the number of contrasts a protein is present in (not NA)
+      present_num = rowSums(!is.na(select(., matches("_vs_")))),
+      # Calculate the % of contrasts a protein is present in
+      present = 100 * present_num / num_contrasts,
+      # Calculate the % of contrasts a protein is differentially expressed in
+      !!expression_column := 100 * rowSums(select(., matches("_vs_")), na.rm = TRUE) / present_num
+    ) %>%
+    # Filter proteins based on cutoff and minimum presence
+    filter(get(expression_column) >= cutoff & present >= min_present) %>%
+    select(Protein.ID, !!expression_column, present) %>%
+    # Join with toptable to get the original logFC values and metadata
+    left_join(toptable, by = "Protein.ID") %>%
+    select(-adj.P.Val) %>%
+    # Sort by % of differentially expressedion in contrasts
+    arrange(desc(get(expression_column)))
+  
+  return(df)
+}
+
+extract_pvalue <- function(results, contrasts, protein_ids){
+  # extract adjusted p-values and lod2FC of query proteins from given contrasts
+  
+  # results: list of limma results for each contrast
+  # protein_ids: vector of protein ids
+  
+  # create temporary list to store dataframes
+  temp_list <- list()
+  # extract data for each contrast
+  for(contrast in contrasts){
+    temp_df <- results[[contrast]] %>%
+      filter(Protein.ID %in% protein_ids) %>%
+      mutate(Contrast = contrast) %>%
+      select(Protein.ID, Description, Contrast, P.Value, adj.P.Val, logFC)
+    # remove rownames to avoid duplicates
+    rownames(temp_df) <- NULL
+    # add dataframe to list
+    temp_list[[contrast]] <- temp_df
+    }
+  # combine all dataframes
+  temp_df <- bind_rows(temp_list)
+  return(temp_df)
+}
+
+save_pheatmap_png <- function(x, filename, width=16, height=9, res = 300,
+                              units = "cm") {
+  # function to save pheatmap as png
+  
+  # x: pheatmap object
+  # filename: name of the file to save
+  # width: width of the plot
+  # height: height of the plot
+  # res: resolution of the plot
+  # units: units of the plot dimensions
+  
+  png(filename, width = width, height = height, res = res, units = units)
+  grid::grid.newpage()
+  grid::grid.draw(x$gtable)
+  dev.off()
+}
+
+plot_volcano <- function(results, name, FC = 2, p.val = 0.05, lab = TRUE) {
+  # Define function to plot volcano plot from results list with given contrast name
+  
+  # results: list of limma results for each contrast
+  # name: name of the contrast to plot
+  # FC: fold change cutoff
+  # p.val: p-value cutoff
+  # lab: logical indicating if putative degraders should be labeled
+  
+  data <- results[[name]]
+  
+  label <- if(exists("putative_degraders") & isTRUE(lab)){
+    putative_degraders$Description} else {NULL}
+    
+  # Check if there are any results
+  if (sum(data$logFC, na.rm = TRUE) == 0) {
+    print(paste("No results found for contrast", name))
+  }
+  else {
+    # Create volcano plot
+    plot <- data %>%
+      # filter out NA values
+      filter(!is.na(.[["logFC"]])) %>%
+      # plot volcano plot
+      EnhancedVolcano(.,
+                      lab = .$Description,
+                      drawConnectors = TRUE,
+                      max.overlaps = 10,
+                      maxoverlapsConnectors = 15,
+                      labSize = 2.0,
+                      selectLab = label,
+                      x = "logFC",
+                      xlab = bquote("log"[2]~"FC"),
+                      xlim = c(-max(abs(.$logFC)), max(abs(.$logFC))),
+                      FCcutoff = FC,
+                      y = "adj.P.Val",
+                      ylab = bquote("-log"[10] ~ "adj. p-value"),
+                      titleLabSize = 11,
+                      axisLabSize = 11,
+                      captionLabSize = 10,
+                      legendLabSize = 11,
+                      legendIconSize = 3,
+                      pCutoff = p.val,
+                      ylim = c(0, 8),
+                      col = c("grey30", "#4575B4","#FEE090", "#D73027"),
+                      title = name %>% str_replace_all("vs", " vs. ") %>% str_replace_all("_", " "),
+                      subtitle = "",
+                      caption = paste0("total = ", nrow(.), " proteins"),
+                      legendLabels = c("NS",
+                                        bquote("|log"[2]~"FC| >" ~ .(FC)),
+                                        paste0("adj. p-value < ",p.val),
+                                        bquote("|log"[2]~"FC| >" ~ .(FC) ~
+                                                 " & adj. p-val. < "~.(p.val)))) +
+  # add vertical line at logFC = 0
+  geom_vline(xintercept = 0, linetype = 1, color = "black")
+
+  return(plot)
+  }
+}
+
+save_plot <- function(plot, filename, format = "png", width = 10, height = 5,
+                          units = "cm", res = 300) {
+  # function to save non ggplots as png or pdf
+  if (format == "png") {
+    png(filename, width = width, height = height, units = units, res = res)
+  } else if (format == "pdf") {
+    pdf(filename, width = width, height = height, onefile = FALSE)
+  } else {
+    stop("Invalid format")
+  }
+  print(plot)
+  dev.off()
+}
+```
+
+### Explore FragPipe output
+```{r load data}
+data_dir <- here("results/nepenthes")
+fragpipe_dir <- here(data_dir, "00_fragpipe")
+# create directory for results
+explore_dir <- here(data_dir, "01_exploration")
+dir.create(explore_dir, showWarnings = FALSE)
+# Import fragpipe results
+data <- rio::import(here(fragpipe_dir, "combined_protein.tsv")) %>%
+  # make column names tidy
+  rename_with(make.names)
+# Import metadata
+metadata <- rio::import(here("data/conditions_metadata.csv"))
+```
+
+#### Explore difference between Intensity and MaxLFQ Intensity
+```{r}
+# Extract Intensities from the data
+data_int <- data %>%
+  # filter out contaminating proteins from cRAP database and trypsin
+  filter(!grepl("cRAP[0-9]{3}", Protein)) %>%
+  filter(!grepl("cRAP[0-9]{3}", Indistinguishable.Proteins)) %>%
+  filter(!grepl("TRY", Entry.Name)) %>%
+  # filter rows without Protein ID
+  filter(!is.na(Protein.ID)) %>%
+  # set Protein.ID as rownames
+  column_to_rownames("Protein.ID") %>%
+  # select columns with Intensities
+  select(ends_with("Intensity"), -contains("MaxLFQ")) %>%
+  # Remove 'Intensity' from column names
+  set_colnames(., str_replace(colnames(.), ".Intensity", "")) %>%
+  log2() %>%
+  # convert -Inf to NA
+  mutate_all(~ifelse(. == -Inf, NA, .))
+
+# are there samples with only NA values?
+data_int %>%
+  select(where(~all(is.na(.)))) %>%
+  colnames()
+
+# Remove samples with only NA values
+data_int <- data_int %>%
+  select(where(~!all(is.na(.))))
+
+# Calculate mean Intensity
+mean_intensity <- data_int %>%
+  select(matches("[NS]_[A-Z]_t[0-5]_[1-3]")) %>%
+  rownames_to_column("Protein.ID") %>%
+  pivot_longer(names_to = "Sample",
+               values_to = "Intensity", -"Protein.ID") %>%
+  # add columns for condition and time
+  separate_wider_delim(Sample,
+                       names = c("Plant", "Condition", "Time", "Replicate"),
+                       delim = "_") %>%
+  # Calculate the mean intensity for each Condition_Time group
+  group_by(Condition, Time, `Protein.ID`) %>%
+  summarise(mean_intensity = mean(Intensity)) %>%
+  ungroup() %>%
+  # add back the sample name
+  mutate(Sample = paste(Condition, Time, sep = "_"),
+  # convert NA to 0
+  mean_intensity = ifelse(is.na(mean_intensity), 0, mean_intensity)) %>%
+  # convert back into wide format
+  select(-Condition, -Time) %>%
+  pivot_wider(names_from = Sample, values_from = mean_intensity) %>%
+  column_to_rownames("Protein.ID") %>%
+  # fitler out rows with all 0s
+  filter(rowSums(.) > 0)
+
+# Create annotation for heatmap
+col_annotation <- mean_intensity %>%
+  colnames() %>% unique() %>%
+  data.frame(Sample = .) %>%
+  mutate(Time = str_extract(Sample, "t[0-5]"),
+         Condition = str_extract(Sample, "^[A-Z]")) %>%
+  column_to_rownames("Sample")
+
+# Create heatmap
+mean_intensity %>%
+  pheatmap(annotation_col = col_annotation,
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  show_rownames = FALSE,
+  main = "Mean log2 Intensity",
+  fontsize = 5,
+  fontsize_col = 8)
+
+# Extract MaxLFQ intensities from the data
+data_MaxLFQ <- data %>%
+  # filter out contaminating proteins from cRAP database
+  filter(!grepl("cRAP[0-9]{3}", Protein)) %>%
+  filter(!grepl("cRAP[0-9]{3}", Indistinguishable.Proteins)) %>%
+  filter(!grepl("TRY", Entry.Name)) %>%
+  # filter rows without Protein ID
+  filter(!is.na(Protein.ID)) %>%
+  # set Protein.ID as rownames
+  column_to_rownames("Protein.ID") %>%
+  # select columns with MaxLFQ intensities
+  select(ends_with("MaxLFQ.Intensity")) %>%
+  # Remove 'Intensity' from column names
+  set_colnames(., str_replace(colnames(.), ".MaxLFQ.Intensity", "")) %>%
+  log2() %>%
+  # convert -Inf to NA
+  mutate_all(~ifelse(. == -Inf, NA, .))
+
+# are there samples with only NA values?
+data_MaxLFQ %>%
+  select(where(~all(is.na(.)))) %>%
+  colnames()
+
+# Remove samples with only NA values
+data_MaxLFQ <- data_MaxLFQ %>%
+  select(where(~!all(is.na(.))))
+
+# Calculate mean MaxLFQ intensity
+mean_MaxLFQ <- data_MaxLFQ %>%
+  select(matches("[NS]_[A-Z]_t[0-5]_[1-3]")) %>%
+  rownames_to_column("Protein.ID") %>%
+  pivot_longer(names_to = "Sample",
+               values_to = "Intensity", -"Protein.ID") %>%
+  # add columns for condition and time
+  separate_wider_delim(Sample,
+                       names = c("Plant", "Condition", "Time", "Replicate"),
+                       delim = "_") %>%
+  # Calculate the mean intensity for each Condition_Time group
+  group_by(Condition, Time, `Protein.ID`) %>%
+  summarise(mean_intensity = mean(Intensity)) %>%
+  ungroup() %>%
+  # add back the sample name
+  mutate(Sample = paste(Condition, Time, sep = "_"),
+  # convert NA to 0
+  mean_intensity = ifelse(is.na(mean_intensity), 0, mean_intensity)) %>%
+  # convert back into wide format
+  select(-Condition, -Time) %>%
+  pivot_wider(names_from = Sample, values_from = mean_intensity) %>%
+  column_to_rownames("Protein.ID") %>%
+  # fitler out rows with all 0s
+  filter(rowSums(.) > 0)
+
+# Create heatmap
+mean_MaxLFQ %>%
+  pheatmap(annotation_col = col_annotation,
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  show_rownames = FALSE,
+  main = "Mean log2 MaxLFQ Intensity",
+  fontsize = 5,
+  fontsize_col = 8)
+
+# Summary table of detected proteins when using Intensity and MaxLFQ Intensity
+data.frame(row.names = c("Intensity", "MaxLFQ Intensity"),
+           # Number of identified proteins
+           Num_proteins = c(nrow(data_int %>%
+                                   # filter rows with all NA
+                                   replace(is.na(.), 0) %>%
+                                   filter(!rowSums(.) == 0)),
+                            nrow(data_MaxLFQ %>%
+                                   # filter rows with all NA
+                                   replace(is.na(.), 0) %>%
+                                   filter(!rowSums(.) == 0))),
+           # Number of detected proteins across all samples
+           Detected = c(sum(data_int > 0, na.rm = TRUE),
+                        sum(data_MaxLFQ > 0, na.rm = TRUE)))
+```
+
+#### Explore differences between conditions at each time point
+```{r}
+for (t in unique(col_annotation$Time)) {
+  mean_intensity %>%
+    select(matches(t)) %>%
+    # fitler out rows with all 0s
+    filter(rowSums(.) > 0) %>%
+    pheatmap(cluster_rows = TRUE,
+             cluster_cols = FALSE,
+             show_rownames = FALSE,
+             main = paste("Mean log2 Intensity at", t),
+             border_color = NA,
+             fontsize = 5)
+}
+```
+#### Number of proteins per sample
+```{r}
+# dotplot of number of proteins per sample
+(data_int %>%
+  summarize_all(~sum(!is.na(.))) %>%
+  pivot_longer(everything(), names_to = "SAMPLEID", values_to = "num_proteins") %>%
+  mutate(FACTOR = str_extract(SAMPLEID, "[A-Z]_t[0-5]"),
+         CONDITION = str_split_i(SAMPLEID, "_", 2),
+         TIME = str_extract(FACTOR, "t[0-5]") %>%
+           str_replace(., "t", "Week ")) %>%
+  # add metadata
+  left_join(metadata, by = c("CONDITION" = "CONDITION")) %>%
+  
+  ggplot(.,aes(x = CONDITION, y = num_proteins, fill = CONDITION)) +
+  geom_dotplot(binaxis = "y", stackdir = "center", dotsize = 2.0) +
+  facet_wrap(~TIME, scales = "free", strip.position = "bottom") +
+  labs(y = "Number of proteins") +
+  theme_classic() +
+  theme(legend.position = "none",
+        axis.title = element_text(size = 9),
+        axis.text.x = element_text(size = 8, vjust = 0.2),
+        axis.title.x = element_blank(),
+        strip.background = element_blank(),
+        strip.placement = "outside") +
+    scale_y_continuous(limits = c(0, 600)) +
+  # use colours as defined in "colors" object
+  scale_fill_manual(values = colors$CONDITION)
+  ) %T>%
+  ggsave(plot = ., filename = here(explore_dir, "proteins_per_sample_NEP.png"),
+         width = 13, height = 8, units = "cm", dpi = 300)
+
+# Visualise shared proteins between conditions
+(data_int %>%
+  rownames_to_column(var = "Protein.ID") %>%
+  pivot_longer(-Protein.ID, names_to = "SAMPLEID", values_to = "Intensity") %>%
+  mutate(CONDITION = str_split_i(SAMPLEID, "_", 2),
+         FACTOR = str_extract(SAMPLEID, "[A-Z]_t[0-5]")) %>%
+  filter(!is.na(Intensity)) %>%
+  group_by(CONDITION) %>%
+  summarize(Protein.IDs = list(Protein.ID)) %>%
+  deframe() %>%
+  UpSetR::fromList() %>%
+  UpSetR::upset(.,
+                nsets = length(.),
+                sets = names(.),
+                keep.order = TRUE,
+                order.by = "freq",
+                sets.x.label = "Proteins per condition",
+                mainbar.y.label = "Protein intersection",
+                point.size = 1.5,
+                mb.ratio = c(0.5, 0.5))
+  )%T>%
+  save_plot(filename = here(explore_dir, "upset_proteins_per_condition_NEP.png"),
+                width = 13, height = 9, res = 300)
+```
+```{r}
+# Shared proteins between conditions at each time point
+for (t in unique(col_annotation$Time)) {
+  data_int %>%
+    select(matches(t)) %>%
+    rownames_to_column(var = "Protein.ID") %>%
+    pivot_longer(-Protein.ID, names_to = "SAMPLEID", values_to = "Intensity") %>%
+    mutate(CONDITION = str_split_i(SAMPLEID, "_", 2),
+           FACTOR = str_extract(SAMPLEID, "[A-Z]_t[0-5]")) %>%
+    filter(!is.na(Intensity)) %>%
+    group_by(CONDITION) %>%
+    summarize(Protein.IDs = list(Protein.ID)) %>%
+    deframe() %>%
+    UpSetR::fromList() %>%
+    UpSetR::upset(.,
+                  nsets = length(.),
+                  sets = names(.),
+                  keep.order = TRUE,
+                  order.by = "freq",
+                  sets.x.label = "Proteins per condition",
+                  mainbar.y.label = "Protein intersection",
+                  point.size = 1.5,
+                  mb.ratio = c(0.5, 0.5)) %>%
+  print()
+}
+```
+### Preprocess data
+#### Filter data
+```{r}
+# create directory for results
+preprocessing_dir <- here(data_dir, "02_preprocessing")
+dir.create(preprocessing_dir, showWarnings = FALSE)
+dir.create(here(preprocessing_dir, "plots"), showWarnings = FALSE)
+```
+
+```{r import feature and sample annotation}
+# Extract protein annotation from fragpipe output 'data'
+feature_annotation <- data %>%
+  dplyr::select('Protein',
+                'Protein.ID',
+                'Entry.Name',
+                'Gene',
+                'Protein.Length',
+                'Organism',
+                'Protein.Existence',
+                'Description',
+                'Protein.Probability',
+                'Top.Peptide.Probability',
+                'Indistinguishable.Proteins') %>%
+  mutate(rownames = Protein.ID) %>%
+  column_to_rownames('rownames')
+
+# Import sample annotation from fragpipe annotation file
+sample_annotation <- rio::import(here(fragpipe_dir, "experiment_annotation.tsv")) %>%
+  dplyr::select(sample, condition) %>%
+  set_colnames(c("SAMPLEID", "CONDITION")) %>%
+  # extract information from sample names using regular expressions
+  mutate(CONDITION = gsub("[NS]_", "", str_extract(SAMPLEID, "[NS]_[A-Z]")),
+         REPLICATE = gsub("_", "", str_extract(SAMPLEID, "_[1-3]$")),
+         TIME = str_extract(SAMPLEID, "t[0-5]"),
+         FACTOR = str_extract(SAMPLEID, "[A-Z]_t[0-5]")) %>%
+  # add metadata
+  left_join(., metadata, by = "CONDITION") %>%
+  mutate(rowname = SAMPLEID) %>%
+  column_to_rownames()
+```
+
+```{r filter data}
+# Filter out proteins occuring in less than 66% of replicates of at least one FACTOR (condition_time)
+assayData <- data_int %>%
+  # convert NA to 0 and integers to 1
+  mutate_all(~ifelse(is.na(.), 0, 1)) %>%
+  # convert to long format
+  rownames_to_column('Protein.ID') %>%
+  pivot_longer(-Protein.ID, names_to = "SAMPLEID", values_to = "Intensity") %>%
+  # join with sample annotation
+  left_join(., sample_annotation, by = "SAMPLEID") %>%
+  # calculate missing values per sample triplicate (FACTOR)
+  group_by(Protein.ID, FACTOR) %>%
+  summarize(n = n(), # number of replicates per protein and FACTOR
+            miss_val = n() - sum(Intensity)) %>% # number of missing values
+  # fitler out proteins
+  filter(miss_val < 2/3*n) %>% # change this value to change threshold
+  ungroup() %>%
+  # extract Protein.IDs
+  pull(Protein.ID) %>%
+  # keep unique Protein.IDs
+  unique()
+
+# filter out rows that are not in assayData
+assayData <- data_int %>%
+  filter(rownames(data_int) %in% assayData) %>%
+  # remove columns with only NA values
+  select(where(~!all(is.na(.))))
+
+# print the number of filtered proteins
+print(paste("Number of proteins filtered out:", nrow(data_int) - nrow(assayData)))
+```
+
+```{r construct eset}
+# Construct eset
+eset <- ExpressionSet(assayData = as.matrix(assayData),
+                      phenoData = AnnotatedDataFrame(sample_annotation)[colnames(assayData),],
+                      featureData = AnnotatedDataFrame(feature_annotation)[rownames(assayData),])
+# Check validity of eset object
+validObject(eset)
+# Save eset
+eset %>% rio::export(here(preprocessing_dir, "eset.RDS"))
+```
+#### Look for missing values
+```{r missing_values_patterns}
+plot_missing_values_heatmap(eset) %T>%
+  save_plot(here(preprocessing_dir, "plots", "missing_values_patterns.png"),
+            width = 16, height = 9, res = 300)
+```
+```{r missing_values_percentage}
+# Calculate the percentage of missing values per protein
+eset %>%
+  exprs(.) %>%
+  data.frame(.) %>%
+  # convert missing values to 0 and valid values to 1
+  mutate_all(~ifelse(is.na(.), 0, 1)) %>%
+  # calculate the percentage of missing values per protein
+  mutate(missing = (1-(rowSums(.)/(ncol(.)-1)))*100) %>%
+  select(missing) %>%
+  # plot the distribution of missing values
+  ggplot(aes(x = missing)) +
+  geom_histogram(binwidth = 1, fill = "blue", color = "black") +
+  labs(x = "Percentage of missing values", y = "Number of proteins") +
+  theme_minimal()
+```
+```{r}
+# calculae the percentage of missing values per sample
+eset %>%
+  exprs(.) %>%
+  data.frame(.) %>%
+  # convert missing values to 0 and valid values to 1
+  mutate_all(~ifelse(is.na(.), 0, 1)) %>%
+  # calculate the percentage of missing values per sample
+  summarise(across(everything(), ~((sum(. == 0) / n()) * 100))) %>%
+  gather(key = "sample", value = "missing") %>%
+  arrange(desc(missing)) %>%
+  # plot the distribution of missing values
+  ggplot(aes(x = missing)) +
+  geom_histogram(binwidth = 1, fill = "blue", color = "black") +
+  labs(x = "Percentage of missing values", y = "Number of samples") +
+  theme_minimal()
+```
+#### Impute missing values
+```{r define imputation methods}
+# function to impute missing values and return eset with imputed MNAR values
+impute_MNAR <- function(eset, method = "minprob"){
+  
+  assertthat::assert_that(method %in% c("minprob", "knn", "rf", "svd"),
+                          msg = "Method must be one of 'minprob', 'knn', 'rf' or 'svd'")
+    # extract information from eset
+  assayData <- exprs(eset) %>% as.data.frame()
+  sample_annotation <- pData(eset)
+  feature_annotation <- fData(eset)
+  
+  # Minprob imputation
+  if (method == "minprob"){
+    imputed_data <- imputeLCMD::impute.MinProb(assayData)
+  }
+  # KNN imputation
+  if (method == "knn"){
+    # perform KNN imputation
+    imputed_data <- assayData %>%
+      as.matrix() %>%
+      impute::impute.knn(., k = 10, colmax = 0.999) %>%
+      # extract imputed data matrix
+      .$data %>%
+      as.data.frame()
+  }
+  # Random forest imputation
+  if (method == "rf"){
+    # Perform RF imputation
+    imputed_data <- missForest::missForest(assayData) %>%
+      # extract imputed data matrix
+      .$ximp
+  }
+  # SVD imputation
+  if (method == "svd"){
+    imputed_data <- pcaMethods::pca(assayData, method = "svdImpute",
+                                      nPcs = 6, verbose = FALSE) %>%
+    # extract imputed data matrix
+    .@completeObs %>%
+    as.data.frame()
+  }
+  # Convert imputed data to long format
+  assayData_imp_long <- imputed_data %>%
+      # add rownames as column
+      mutate('Protein.ID' = rownames(assayData)) %>%
+      pivot_longer(-Protein.ID,
+                   values_to = "imputed",
+                   names_to = "SAMPLEID")
+  
+  assayData_long <- assayData %>%
+    rownames_to_column('Protein.ID') %>%
+    # convert to long format
+    pivot_longer(-Protein.ID,
+                 names_to = "SAMPLEID",
+                 values_to = "Intensity") %>%
+    # add indicator for missing values. 0 = missing, 1 = detected
+    mutate(detected = as.numeric(!is.na(Intensity))) %>%
+    left_join(sample_annotation)
+  
+  # Create mask for MNAR values
+  # Calculate the sum of detected values for each protein and condition
+  # this way imputed values for MAR are not adopted into the final data set
+  mask <- assayData_long %>%
+    dplyr::select('Protein.ID', FACTOR, detected) %>%
+    group_by(`Protein.ID`, FACTOR) %>%
+    summarize_all(sum)
+  
+  # Combine imputed and detected values
+  assayData_summary <- assayData_long %>%
+    dplyr::select(-detected) %>%
+    # join with mask
+    left_join(mask) %>%
+    # join with imputed data
+    left_join(assayData_imp_long) %>%
+    # create new column with imputed values if detected == 0, else use detected values
+    mutate(LFQ = ifelse(detected > 0, Intensity, imputed)) %>%
+    dplyr::select(`Protein.ID`, SAMPLEID, LFQ) %>%
+    # convert to wide format
+    pivot_wider(names_from = SAMPLEID,
+                values_from = LFQ) %>%
+    column_to_rownames('Protein.ID')
+  
+  # Create new eset with imputed values
+  eset_imputed <- ExpressionSet(assayData = as.matrix(assayData_summary),
+                        phenoData = AnnotatedDataFrame(sample_annotation)[colnames(assayData_summary),],
+                        featureData = AnnotatedDataFrame(feature_annotation)[rownames(assayData_summary),])
+  # Return eset with imputed values
+  return(eset_imputed)
+  }
+```
+
+
+```{r impute values}
+# Import eset containing pre-processed data
+eset <- rio::import(here(preprocessing_dir, "eset.RDS"))
+# Loop through imputation methods and impute values
+methods <- c("minprob", "knn", "rf", "svd")
+for (m in methods){
+  name <- paste0("eset_imputed_", m)
+  assign(name, impute_MNAR(eset, method = m))
+  # export eset
+  get(name) %>%
+    rio::export(here(preprocessing_dir, paste0(name, ".RDS")))
+}
+```
+##### Compare imputation methods
+```{r compare imputation methods 1}
+# Function to compute withinness and betweenness
+compute_similarity <- function(eset, unimputed = NULL, k = 2) {
+  data_imp <- eset %>%
+    exprs() %>%
+    as.data.frame() %>%
+    mutate_all(~ifelse(is.na(.), 0, .)) %>% 
+    as.matrix()
+  
+  data <- unimputed %>%
+    exprs() %>%
+    as.data.frame() %>%
+    mutate_all(~ifelse(is.na(.), 0, .)) %>% 
+    as.matrix()
+  
+  sample_annotation <- pData(eset)
+  cond <- as.factor(sample_annotation$CONDITION)
+  name <- str_split_i(deparse(substitute(eset)), "_", -1)
+  
+  metrics <- msImpute::computeStructuralMetrics(x = data_imp,
+                                                y = data,
+                                                group = cond,
+                                                k)
+  return(list(withinness = metrics$withinness,
+              betweenness = metrics$betweenness,
+              gw_dist = metrics$gw_dist))
+}
+
+dfs <- c(eset_imputed_minprob, eset_imputed_knn, eset_imputed_rf, eset_imputed_svd)
+names <- c("MinProb", "KNN", "RF", "SVD")
+
+# create empty dataframes to store withinness and betweenness
+withinness_df <- matrix(NA,
+                        ncol = length(unique(sample_annotation$CONDITION)),
+                        nrow = 0) %>%
+  as.data.frame()
+betweenness_df <- data.frame(matrix(NA, nrow = 0, ncol = 2))
+
+# Loop through esets and compute similarity metrics for each eset
+for (i in seq_along(dfs)) {
+  name <- names[i]
+  df <- dfs[[i]]
+  metrics <- compute_similarity(df, unimputed = eset, k = ncol(df))
+  
+  # Append withinness to withinness_df
+  withinness_df <- rbind(withinness_df, metrics$withinness)
+  
+  # Append betweenness and gw_dist to betweenness_df
+  betweenness_df <- rbind(betweenness_df,
+                          cbind(betweenness = metrics$betweenness,
+                                gw_dist = metrics$gw_dist))
+  
+  # Set column names for withinness_df and betweenness_df
+  rownames(withinness_df)[i] <- name
+  rownames(betweenness_df)[i] <- name
+}
+
+# Display the resulting data frames
+withinness_df %>%
+  rowwise() %>%
+  # calculate mean withinness and sd for imputation method
+  mutate(withinness_mean = mean(c_across(-1), na.rm = TRUE),
+         withinness_sd = sd(c_across(-1))) %>%
+  select(withinness_mean, withinness_sd) %>%
+  cbind(., betweenness_df)
+```
+Is the variance of the imputed data similar to the variance of the native data?\
+```{r imputation_variance}
+# Plot mean vs. CV^2 for unimputed and imputed data and save the plot
+patchwork::wrap_plots(
+plot_mean_sd(eset, main = "Unimputed"),
+plot_mean_sd(eset_imputed_minprob, main = "MinProb imputation"),
+plot_mean_sd(eset_imputed_rf, main = "RF imputation"),
+plot_mean_sd(eset_imputed_svd, main = "SVD imputation"),
+plot_mean_sd(eset_imputed_knn, main = "KNN imputation")) %T>% 
+  ggsave(plot = ., filename = here(preprocessing_dir, "plots", "mean_sd_NEP.png"),
+         width = 16, height = 10, units = "cm", dpi = 300)
+```
+How do the density curves of the imputed data compare to the density curves of the native data?\
+```{r imputation_density_curves}
+# Plot density curves of imputed and native data
+# adaptation of the plot_imputation() from the DEP package to work with eset
+dfs <- list("Unimputed" = eset, "MinProb imputation" = eset_imputed_minprob,
+            "RF imputation" = eset_imputed_rf, "KNN imputation" = eset_imputed_knn)
+
+(map_df(dfs, join_long, .id = "var") %>%
+    # add column indicating the data frame
+    mutate(var = factor(var, levels = names(dfs))) %>%
+    # plot density curves
+    ggplot() +
+    geom_density(aes(x = value, col = CONDITION),
+                 alpha = 0,
+                 na.rm = TRUE) +
+    facet_wrap(~var, ncol = 2, nrow = 2, scales = "free") +
+    labs(x = expression(log[2]~"Intensity"), y = "Density") +
+    theme_classic() +
+    theme(axis.title = element_text(size = 9),
+          strip.background = element_blank(),
+          strip.placement = "outside",
+          legend.key.size = unit(0.3, "cm"),
+          legend.text = element_text(size = 8)) +
+    # change colors
+    scale_color_manual(values = colors$CONDITION) +
+    # change legend title
+    guides(col = guide_legend(title = "Condition")) +
+    # axis limits
+    coord_cartesian(ylim = c(0, 0.7)) +
+    scale_x_continuous(limits = c(0, 45))
+) %T>%
+# save plot
+ggsave(plot = .,
+       filename = here(preprocessing_dir, "plots", "imputation_plot.png"),
+       width = 13, height = 9, dpi = 300, units = "cm")
+```
+##### Explore imputation
+```{r missing_values_pattern_imp}
+# Plot a heatmap of proteins with missing values
+plot_missing_values_heatmap(eset_imputed_minprob) %T>%
+  save_plot(here(preprocessing_dir, "plots", "missing_values_patterns_imputed.png"),
+            width = 16, height = 9, res = 300)
+```
+##### PCA
+```{r PCA unimputed}
+eset %>%
+  exprs(.) %>%
+  data.frame(.) %>%
+  # convert NAs to 0 as prcomp does not accept NAs
+  mutate_all(~ifelse(is.na(.), 0, .)) %>%
+  # transpose to have samples as rows
+  t() %>%
+  data.frame() %>%
+  # perform PCA
+  prcomp(., center = TRUE, scale. = TRUE) %>%
+  # plot PCA
+  autoplot(., data = sample_annotation[colnames(eset),],
+           colour = "WORM",
+           shape = "PLASTIC",
+           frame = TRUE,
+           frame.color = "WORM") +
+  theme_classic() +
+  scale_color_manual(values = colors$WORM) +
+  scale_fill_manual(values = colors$WORM)
+  
+ggsave(plot = last_plot(), here(preprocessing_dir, "plots", "PCA_unimputed.png"),
+            width = 16, height = 9, dpi = 300, units = "cm")
+```
+```{r PCA imputed}
+eset_imputed_minprob %>%
+  exprs(.) %>%
+  data.frame(.) %>%
+  # convert NAs to 0 as prcomp does not accept NAs
+  mutate_all(~ifelse(is.na(.), 0, .)) %>%
+  # transpose to have samples as rows
+  t() %>%
+  data.frame() %>%
+  # perform PCA
+  prcomp(., center = TRUE, scale. = TRUE) %>%
+  # plot PCA
+  autoplot(., data = sample_annotation[colnames(eset),],
+           colour = "WORM",
+           shape = "PLASTIC",
+           frame = TRUE,
+           frame.color = "WORM") +
+  theme_classic() +
+  scale_color_manual(values = colors$WORM) +
+  scale_fill_manual(values = colors$WORM)
+
+ggsave(plot = last_plot(), here(preprocessing_dir, "plots", "PCA_imputed.png"),
+            width = 16, height = 9, dpi = 300, units = "cm")
+```
+### Differential expression analysis in LIMMA 
+#### DE between conditions
+This analysis does not consider time, which is likely to have an effect on protein expression. This is a preliminary analysis to identify proteins that are differentially expressed between conditions. A more comprehensive analysis will be performed later, considering both condition and time.
+
+```{r}
+# create directory for limma results
+limma_dir <- here(data_dir, "03_limma")
+dir.create(limma_dir, showWarnings = FALSE)
+dir.create(here(limma_dir, "plots"), showWarnings = FALSE)
+```
+```{r linear model with limma: condition}
+# Import eset
+eset <- rio::import(here(preprocessing_dir, "eset.RDS"))
+
+# Convert 'CONDITION', 'TIME' and 'FACTOR' to factors
+eset$CONDITION <- as.factor(eset$CONDITION)
+eset$TIME <- as.factor(eset$TIME)
+eset$FACTOR <- as.factor(eset$FACTOR)
+
+# Construct design matrix
+design <- model.matrix(~0 + CONDITION, data = eset)
+colnames(design) <- levels(eset$CONDITION)
+
+# Define conditions for contrast matrix
+contrasts <- list()
+# Make contrasts of all conditions against each other
+for (i in levels(eset$CONDITION)){
+  for (j in levels(eset$CONDITION)){
+    if (i != j){
+      contrast_name <- paste(i, "vs", j, sep = "_")
+      contrast <- paste(i, j, sep = " - ")
+      contrasts[[contrast_name]] <- contrast}
+  }
+}
+# Construct constrast matrix
+contrast_matrix <- makeContrasts(contrasts = contrasts, levels = design)
+colnames(contrast_matrix) <- names(contrasts)
+
+# Define linear model
+fit_C <- eset %>%
+  # linear regression of every protein against designmatrix as covariable
+  lmFit(design) %>%
+  # include constrast matrix
+  contrasts.fit(contrast_matrix) %>%
+  # Empirical Bayes Statistics for Differential Expression
+  eBayes
+
+# Save limma results of each contrast in a list
+results_C <- contrasts %>%
+  # get vector of contrast names
+  names() %>%
+  # name each element in the vector with its own value
+  set_names(.,.) %>%
+  # create named list of results for each contrast
+  purrr::map(function(coef, fit_C){
+    topTable(fit_C, 
+             coef = coef, 
+             number = Inf)
+  }, fit = fit_C)
+```
+##### All conditions vs water blank
+Look at all conditions against the blank (A):
+```{r}
+# all conditions vs blank
+top_proteins <- topTable(fit_C,
+                         number = Inf,
+                         coef = grep("[A-Z]_vs_A",
+                                     colnames(fit_C$coefficients))) %>% 
+  select(Protein.ID, Description, adj.P.Val ,matches("_vs_"))
+
+plot_heatmap(top_proteins,
+             annotation = c("JASMONATE", "PLASTIC", "WORM"),
+             FC = 2,
+             treeheight_row = 0) %T>%
+  save_pheatmap_png(.,filename = here(limma_dir, "plots", "HM_all_vs_blank.png"),
+                    width = 16, height = 9, res = 300)
+count_deregulated_proteins(top_proteins)
+identify_deregulated_proteins(top_proteins, cutoff = 40, min_present = 30) %>%
+  arrange(desc(present))
+```
+##### Dry worm vs dry worm blank
+Look at dry worm conditions vs dry worm blanks - G vs B, K vs B, H vs B, L vs B
+```{r}
+top_proteins <- topTable(fit_C,
+                         number = Inf,
+                         coef = grep("[GKHL]_vs_B",
+                                     colnames(fit_C$coefficients))) %>% 
+  select(Protein.ID, Description, adj.P.Val ,matches("_vs_"))
+
+plot_heatmap(top_proteins,
+             annotation = c("JASMONATE", "PLASTIC", "WORM"),
+             FC = 2,
+             title = "All conditions vs blank")
+count_deregulated_proteins(top_proteins)
+identify_deregulated_proteins(top_proteins, cutoff = 40, min_present = 30) %>%
+  arrange(desc(present))
+```
+##### Live worm vs live worm blank
+Look at live worm conditions vs live worm blanks - M, O, N, P vs F and Q
+```{r Live worm vs live worm blank}
+top_proteins <- topTable(fit_C,
+                         number = Inf,
+                         coef = grep("[MNOP]_vs_[FQ]",
+                                     colnames(fit_C$coefficients))) %>% 
+  select(Protein.ID, Description, adj.P.Val ,matches("_vs_"))
+
+plot_heatmap(top_proteins,
+             annotation = c("JASMONATE", "PLASTIC", "WORM"),
+             FC = 2,
+             title = "Live worm vs live worm blank",
+             treeheight_row = 0)
+count_deregulated_proteins(top_proteins)
+identify_deregulated_proteins(top_proteins, cutoff = 40, min_present = 30) %>%
+  arrange(desc(present))
+```
+##### Live worm vs dry worm
+Look at conditions with live worms vs their respective dry worm counterparts:
+```{r Live worm vs dry worm}
+contrasts <- c("F_vs_B", "M_vs_G", "O_vs_K", "N_vs_H", "P_vs_L")
+top_proteins <- topTable(fit_C,
+                         number = Inf,
+                         coef = grep(paste(contrasts, collapse = "|"),
+                                     colnames(fit_C$coefficients))) %>% 
+  select(Protein.ID, Description, Organism, adj.P.Val ,matches("_vs_"))
+
+plot_heatmap(top_proteins,
+             annotation = c("JASMONATE", "PLASTIC"),
+             FC = 2,
+             treeheight_row = 0) %T>%
+  save_pheatmap_png(.,filename = here(limma_dir, "plots", "HM_live_vs_dry.png"),
+                    width = 16, height = 9, res = 300)
+count_deregulated_proteins(top_proteins)
+count_deregulated_proteins(top_proteins, FC = 0) %>% summarise_all(sum)
+identify_deregulated_proteins(top_proteins, cutoff = 40, min_present = 30) %>%
+  arrange(desc(present))
+```
+##### Jasmonate vs jasmonate blanks
+Look at conditions with jasmonate vs their respective jasmonate blanks:
+```{r Jasmonate vs jasmonate blanks}
+contrasts <- c("Q_vs_F", "I_vs_D", "K_vs_G",
+               "O_vs_M", "J_vs_E", "L_vs_H", "P_vs_N")
+top_proteins <- topTable(fit_C,
+                         number = Inf,
+                         coef = grep(paste(contrasts, collapse = "|"),
+                                     colnames(fit_C$coefficients))) %>% 
+  select(Protein.ID, Description, Organism, adj.P.Val ,matches("_vs_"))
+
+plot_heatmap(top_proteins,
+             annotation = c("PLASTIC", "WORM"),
+             FC = 2,
+             treeheight_row = 0) %T>%
+  save_pheatmap_png(.,filename = here(limma_dir, "plots", "HM_jasmonate_vs_blank.png"),
+                    width = 16, height = 9, res = 300)
+count_deregulated_proteins(top_proteins)
+count_deregulated_proteins(top_proteins, FC = 0) %>%  summarise_all(sum)
+identify_deregulated_proteins(top_proteins, cutoff = 40, min_present = 30) %>%
+  arrange(desc(present))
+```
+##### Worm vs no worm
+Compare plastic containing conditions with worm to their respective worm free counterparts:
+```{r}
+contrasts <- c("G_vs_D", "K_vs_I", "M_vs_D", "O_vs_I",
+               "H_vs_E", "L_vs_J", "N_vs_E", "P_vs_J")
+top_proteins <- topTable(fit_C,
+                         number = Inf,
+                         coef = grep(paste(contrasts, collapse = "|"),
+                                     colnames(fit_C$coefficients))) %>% 
+  select(Protein.ID, Organism, Description, adj.P.Val ,matches("_vs_"))
+
+plot_heatmap(top_proteins,
+             annotation = c("JASMONATE", "PLASTIC", "WORM"),
+             FC = 2,
+             title = "Worm vs no worm",
+             treeheight_row = 0)
+count_deregulated_proteins(top_proteins)
+# count deregulation of proteins excluing worm associated proteins
+top_proteins %>%
+  filter(!grepl("tenebrio molitor", Organism, ignore.case=TRUE)) %>%
+count_deregulated_proteins()
+top_proteins %>%
+  filter(!grepl("tenebrio molitor", Organism, ignore.case=TRUE)) %>%
+  identify_deregulated_proteins(cutoff = 40, min_present = 30)
+```
+##### Plastic vs no plastic
+Compare plastic containing conditions to their respective plastic free counterparts:
+```{r}
+contrasts <- c("D_vs_A", "I_vs_C", "G_vs_B", "M_vs_F", "O_vs_Q",
+               "E_vs_A", "J_vs_C", "H_vs_B", "N_vs_F", "P_vs_Q")
+top_proteins <- topTable(fit_C,
+                         number = Inf,
+                         coef = grep(paste(contrasts, collapse = "|"),
+                                     colnames(fit_C$coefficients))) %>% 
+  select(Protein.ID, Organism, Description, adj.P.Val ,matches("_vs_"))
+
+plot_heatmap(top_proteins,
+             annotation = c("JASMONATE", "PLASTIC", "WORM"),
+             FC = 2,
+             treeheight_row = 0) %T>%
+  save_pheatmap_png(.,filename = here(limma_dir, "plots", "HM_plastic_vs_nopalstic.png"),
+                    width = 16, height = 9, res = 300)
+count_deregulated_proteins(top_proteins) %>%
+  mutate(influence = ifelse(up>down, "+", "-"))
+count_deregulated_proteins(top_proteins) %>%
+  summarise_all(sum)
+identify_deregulated_proteins(top_proteins, cutoff = 70, min_present = 50)
+```
+#### DE between time points
+Make a model of the form ~0 + TIME to compare the time points against each other.
+```{r linear model with limma: time}
+# Import eset
+eset <- rio::import(here(preprocessing_dir, "eset.RDS"))
+
+# Convert 'CONDITION', 'TIME' and 'FACTOR' to factors
+eset$CONDITION <- as.factor(eset$CONDITION)
+eset$TIME <- as.factor(eset$TIME)
+eset$FACTOR <- as.factor(eset$FACTOR)
+
+# Construct design matrix
+design <- model.matrix(~0 + TIME, data = eset)
+colnames(design) <- levels(eset$TIME)
+
+# Define conditions for contrast matrix
+contrasts <- list(
+  "t1_vs_t0" = "t1 - t0",
+  "t3_vs_t0" = "t3 - t0",
+  "t5_vs_t0" = "t5 - t0",
+  "t3_vs_t1" = "t3 - t1",
+  "t5_vs_t1" = "t5 - t1",
+  "t5_vs_t3" = "t5 - t3"
+)
+# Construct constrast matrix
+contrast_matrix <- makeContrasts(contrasts = contrasts, levels = design)
+colnames(contrast_matrix) <- names(contrasts)
+
+# Define linear model
+fit_T <- eset %>%
+  # linear regression of every protein against designmatrix as covariable
+  lmFit(design) %>%
+  # include constrast matrix
+  contrasts.fit(contrast_matrix) %>%
+  # Empirical Bayes Statistics for Differential Expression
+  eBayes
+
+# Save limma results of each contrast in a list
+results_T <- contrasts %>%
+  # get vector contrast names
+  names() %>%
+  # name each element in the vector with its own value
+  set_names(.,.) %>%
+  # create named list of results for each contrast
+  purrr::map(function(coef, fit_T){
+    topTable(fit_T, 
+             coef = coef, 
+             number = Inf)
+  },  fit = fit_T)
+```
+```{r time comparison}
+top_proteins <- topTable(fit_T,
+                         number = Inf) %>% 
+  select(Protein.ID, Organism, Description, adj.P.Val ,matches("_vs_"))
+
+plot_heatmap(top_proteins,
+             FC = 2,
+             treeheight_row = 0,
+             treeheight_col = 0) %T>%
+  save_pheatmap_png(.,filename = here(limma_dir, "plots", "HM_time_comparison.png"),
+                    width = 16, height = 9, res = 300)
+count_deregulated_proteins(top_proteins)
+identify_deregulated_proteins(top_proteins, cutoff = 50, min_present = 50) %>%
+  arrange(desc(present))
+```
+
+```{r volcano plots time comparison}
+# Create volcano plots of time point comparison
+names <- grep("_vs_", colnames(fit_T$coefficients), value = TRUE)
+volcano_plots_T <- purrr::map(names, ~plot_volcano(results_T, .x)) %>%
+  set_names(names)
+purrr::walk(volcano_plots_T, print)
+```
+
+```{r}
+# save volcano plots t1_vs_t0, t3_vs_t1 and t5_vs_t1 in one plot
+cowtheme <-   theme(legend.position = "none",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        plot.subtitle = element_text(size=10, vjust=0.5),
+        plot.margin = margin(6, 0, 6, 0))
+
+p1 <- volcano_plots_T[["t1_vs_t0"]] +
+  cowtheme +
+  labs(title = NULL, subtitle = "week 1 vs. week 0") +
+  xlim(-12.5, 12.5)
+p2 <- volcano_plots_T[["t3_vs_t1"]] +
+  cowtheme +
+  labs(title = NULL, subtitle = "week 3 vs. week 1") +
+  ylab(NULL) +
+  xlim(-12.5, 12.5)
+p3 <- volcano_plots_T[["t5_vs_t1"]] +
+  cowtheme +
+  labs(title = NULL, subtitle = "week 5 vs. week 1") +
+  ylab(NULL) +
+  xlim(-12.5, 12.5)
+
+# combine the three volcano plots in one row
+top_row <- cowplot::plot_grid(p1, p2, p3, align = "hv", nrow = 1)
+# extract legend from one of the volcano plots
+legend <- cowplot::get_plot_component(volcano_plots_T[["t5_vs_t1"]],
+                                      'guide-box-top', return_all = TRUE)
+# combine top row and legend
+cowplot::plot_grid(top_row, legend, rel_heights = c(1, 0.1), nrow = 2) %T>%
+  ggsave(., filename = here(limma_dir, "plots", "VOL_time_comparison.png"),
+         width = 16, height = 9, units = "cm", dpi = 300, bg = "white")
+```
+#### DE between conditions and time
+```{r linear model with limma: condition and time}
+# Import eset
+eset <- rio::import(here(preprocessing_dir, "eset.RDS"))
+
+# Convert 'CONDITION', 'TIME' and 'FACTOR' to factors
+eset$CONDITION <- as.factor(eset$CONDITION)
+eset$TIME <- as.factor(eset$TIME)
+eset$FACTOR <- as.factor(eset$FACTOR)
+
+# Construct design matrix
+design <- model.matrix(~0 + FACTOR, data = eset)
+# set names for the design matrix columns
+colnames(design) <- levels(eset$FACTOR)
+
+# Initiate contrast list
+contrasts <- list()
+# For each condition make contrast of time points: A_t1-A_t0, A_t3-A_t1, ...
+# Loop through conditions
+for (condition in levels(eset$CONDITION)){
+  # initiate prev_factor as last factor in the condition
+  # factors are in reverse order to get "later time point - earlier time point"
+  prev_factor <- grep(condition, rev(levels(eset$FACTOR)), value = TRUE)[1]
+  # loop through remaining factors of the condition and build contrasts
+  for (factor in grep(condition, rev(levels(eset$FACTOR)), value = TRUE)[-1]){
+    # Create contrast name and contrast
+    contrast_name <- paste(prev_factor, "vs", factor, sep = "_")
+    contrast <- paste(prev_factor, factor, sep = " - ")
+    # Store contrast in the list
+    contrasts[[contrast_name]] <- contrast
+    # Update prev_factor
+    prev_factor <- factor
+  }
+}
+# For each time point make contrasts of factors: A_t1-B_t1, A_t1-C_t1, ...
+# Loop through time points
+for (t in levels(eset$TIME)){
+  # Iterate through each combination of factors
+  for(factor in grep(t, levels(eset$FACTOR), value = TRUE)){
+    for (factor2 in grep(t, levels(eset$FACTOR), value = TRUE)){
+      # Check if factors are not identical
+      if (!identical(factor, factor2)){
+        # Create contrast name and contrast
+        contrast_name <- paste(substr(factor,1, 1), "vs", factor2, sep = "_")
+        contrast <- paste(factor, factor2, sep = " - ")
+        # Store contrast in the list
+        contrasts[[contrast_name]] <- contrast
+      }
+    }
+  }
+}
+# Construct constrast matrix
+contrast_matrix <- makeContrasts(contrasts = contrasts, levels = design)
+colnames(contrast_matrix) <- names(contrasts)
+
+# Define linear model
+fit <- eset %>%
+  # linear regression of every protein against designmatrix as covariable
+  lmFit(design) %>%
+  # include constrast matrix
+  contrasts.fit(contrast_matrix) %>%
+  # Empirical Bayes Statistics for Differential Expression
+  eBayes
+
+# Save limma results of each contrast in a list
+results <- contrasts %>%
+  # get vector contrast names
+  names() %>%
+  # name each element in the vector with its own value
+  set_names(.,.) %>%
+  # create named list of results for each contrast
+  purrr::map(function(coef, fit){
+    topTable(fit, 
+             coef = coef, 
+             number = Inf)
+  },  fit = fit)
+
+# Export limma results as Excel sheet
+results %>%
+  openxlsx::write.xlsx(here(limma_dir, "limma_results.xlsx"))
+```
+
+##### PCA of limma results
+
+```{r limma_PCA}
+# PCA of limma results
+fit %>%
+  topTable(., number = Inf) %>%
+  # select contrasts only
+  select(names(contrasts)) %>%
+  # change NA to 0
+  replace(is.na(.), 0) %>%
+  # filter rows with all 0
+  filter(!rowSums(.) == 0) %>%
+  # filter columns with all 0
+  select_if(~!all(. == 0)) %>%
+  # transpose to have contrasts as rows
+  t() %>%
+  data.frame() %>%
+  # perform PCA
+  prcomp(., center = TRUE, scale. = TRUE) %>%
+  # plot PCA
+  autoplot(., x = 1, y = 2, loadings = FALSE) +
+  ggtitle("PCA of limma results") +
+  theme_classic()
+
+ggsave(plot = last_plot(), here(limma_dir, "plots", "PCA_limma.png"),
+            width = 13, height = 9, dpi = 300, units = "cm")
+```
+
+##### PET vs PET blank
+Look at PET containing conditions (G, I, K, M, O) against the PET blank (D):\
+These conditions degraded PET the most as evidenced by HPLC analysis.
+```{r PET_vs_blank}
+top_proteins_PET <- topTable(fit, 
+                             number = Inf,
+                             coef = grep("[OMKIG]_vs_D_t[0-5]",
+                                         colnames(fit$coefficients))) %>% 
+  select(Protein.ID, Description, Organism, adj.P.Val, matches("_vs_"))
+
+plot_heatmap(top_proteins_PET,
+             annotation = c("TIME", "WORM", "JASMONATE"),
+             treeheight_row = 0)
+# Create table with the number of deregulated proteins
+count_deregulated_proteins(top_proteins_PET, FC = 0)
+count_deregulated_proteins(top_proteins_PET, FC = 0) %>%
+  summarize_all(sum)
+# Which proteins are overexpressed in in factors compared to the blank?
+identify_deregulated_proteins(top_proteins_PET, FC = 2, cutoff = 50, min_present = 40)
+```
+```{r volcano_plots_PET}
+# Create volcano plots for PET conditions vs PET blank
+names <- grep("[OMKIG]_vs_D_t[0-5]", colnames(fit$coefficients), value = TRUE)
+volcano_plots_PET <- purrr::map(names, ~plot_volcano(results, .x)) %>%
+  set_names(names)
+purrr::walk(volcano_plots_PET, print)
+```
+###### PET time difference
+Does the protein abundance within each PET condition change over time?
+```{r PET_time}
+top_proteins_PET_t <- topTable(fit,
+                         number = Inf,
+                         coef = grep("[OMKIGD]_t[0-5]_vs_[OMKIGD]_t[0-5]",
+                                     colnames(fit$coefficients)),
+                         lfc = 0.5) %>% 
+  select(Protein.ID, Description, adj.P.Val ,matches("_vs_"))
+
+plot_heatmap(top_proteins_PET_t,
+             annotation = c("JASMONATE", "WORM", "TIME"),
+             FC = 2,
+             title = "PET time difference")
+# Create table with the number of deregulated proteins
+count_deregulated_proteins(top_proteins_PET_t, FC = 0)
+count_deregulated_proteins(top_proteins_PET_t, FC = 0) %>%
+  summarize_all(sum)
+identify_deregulated_proteins(top_proteins_PET_t, cutoff = 50, min_present = 40)
+```
+```{r volcano_plots_PET_t}
+# Create volcano plots for PET conditions comparing time points
+names <- grep("[OMKIGD]_t[0-5]_vs_[OMKIGD]_t[0-5]", colnames(fit$coefficients), value = TRUE)
+volcano_plots_PET_t <- purrr::map(names, ~plot_volcano(results, .x)) %>%
+  set_names(names)
+purrr::walk(volcano_plots_PET_t, print)
+```
+##### PBAT vs PBAT blank
+HPLC results indicated best degradation in conditions following this order: P > N > J > L = H > E.\
+```{r PBAT_vs_blank}
+top_proteins <- topTable(fit,
+                         number = Inf,
+                         coef = grep("[NPJLHE]_vs_[HE]_t[0-5]",
+                                     colnames(fit$coefficients))) %>% 
+  select(Protein.ID, Description, Organism, adj.P.Val ,matches("_vs_"))
+
+top_proteins %>%
+  # remove proteins from tenenbrio molitor
+  #filter(!grepl("tenebrio", Organism, ignore.case = TRUE)) %>%
+plot_heatmap(.,
+             annotation = c("TIME", "WORM", "JASMONATE"),
+             FC = 2,
+             title = "PBAT vs blank")
+# Create table with the number of deregulated proteins
+count_deregulated_proteins(top_proteins, FC = 0)
+count_deregulated_proteins(top_proteins, FC = 0) %>%
+  summarize_all(sum)
+# Which proteins are overexpressed in in factors compared to the blank?
+identify_deregulated_proteins(top_proteins, cutoff = 40, min_present = 30)
+```
+```{r PBAT high degraders vs blank}
+top_proteins <- topTable(fit,
+                         number = Inf,
+                         coef = grep("[J]_vs_[EH]_t[0-5]|[NP]_vs_[J]_t[0-5]",
+                                     colnames(fit$coefficients))) %>% 
+  select(Protein.ID, Description, Organism, adj.P.Val ,matches("_vs_"))
+
+plot_heatmap(top_proteins,
+             annotation = c("TIME", "WORM", "JASMONATE"),
+             FC = 2,
+             title = "PBAT high degraders vs blank")
+
+# Create table with the number of deregulated proteins
+count_deregulated_proteins(top_proteins, FC = 0)
+count_deregulated_proteins(top_proteins, FC = 0) %>%
+  summarize_all(sum)
+```
+
+```{r volcano_plots_PBAT}
+# Create volcano plots for PET conditions vs PET blank
+names <- grep("[JLNP]_vs_[EH]_t[0-5]",
+              colnames(fit$coefficients), value = TRUE)
+olcano_plots_PBAT <- purrr::map(names, ~plot_volcano(results, .x)) %>%
+  set_names(names)
+purrr::walk(volcano_plots_PBAT, print)
+```
+###### PBAT time difference
+Does the protein abundance within each PBAT condition change over time?
+```{r PBAT_time}
+top_proteins_PBAT_t <- topTable(fit,
+                         number = Inf,
+                         coef = grep("[HJLNPE]_t[0-5]_vs_[HJLNPE]_t[0-5]",
+                                     colnames(fit$coefficients)),
+                         lfc = 0.5) %>% 
+  select(Protein.ID, Description, adj.P.Val ,matches("_vs_"))
+
+plot_heatmap(top_proteins_PBAT_t,
+             annotation = c("TIME", "WORM", "JASMONATE"),
+             FC = 2,
+             title = "PBAT time difference")
+# Create table with the number of deregulated proteins
+count_deregulated_proteins(top_proteins_PBAT_t, FC = 0)
+count_deregulated_proteins(top_proteins_PBAT_t, FC = 0) %>%
+  summarize_all(sum)
+identify_deregulated_proteins(top_proteins_PBAT_t, cutoff = 40, min_present = 30)
+```
+
+```{r volcano_plots_PBAT_t}
+# Create volcano plots for PBAT conditions comparing time points
+names <- grep("[HJLNPE]_t[0-5]_vs_[HJLNPE]_t[0-5]", colnames(fit$coefficients), value = TRUE)
+volcano_plots_PBAT_t <- purrr::map(names, ~plot_volcano(results, .x)) %>%
+  set_names(names)
+purrr::walk(volcano_plots_PBAT_t, print)
+```
+
+##### Identify putative plastic degrading proteins
+Identify the proteins that are overexpressed in PET and PBAT samples compared to the lowest plastic degrading conditions for each respective plastic.
+```{r most interesting proteins}
+# list of uninteresting proteins to exclude
+exclude <- c("actin", "ribosomal", "polymerase", "ATP synthase", "Ras", "Lpp",
+             "chaperonin", "tubulin", "elongation", "transcription", "histone")
+
+# create table with overexpressed proteins in promising conditions
+topTable(fit,
+         number = Inf,
+         coef = grep("[OM]_vs_[DG]_t[0-5]|[NP]_vs_[HE]_t[0-5]",
+                     colnames(fit$coefficients)),
+         lfc = 0.5) %>%
+  select(Protein.ID, Description, Organism, adj.P.Val, matches("_vs_")) %>%
+  # filter out uninteresting proteins
+  filter(!grepl(paste(exclude, collapse = "|"),
+                Description, ignore.case = TRUE)) %>%
+  # count number of overexpression per protein
+  identify_deregulated_proteins(FC = 2, cutoff = 50, min_present = 50)
+```
+Also compare to live worm conditions F and Q, which do not contain any plastic.
+```{r}
+topTable(fit,
+         number = Inf,
+         coef = grep("[OM]_vs_[FQ]_t[0-5]|[NP]_vs_[FQ]_t[0-5]",
+                     colnames(fit$coefficients)),
+         lfc = 0.5) %>%
+  select(Protein.ID, Description, Organism, adj.P.Val, matches("_vs_")) %>%
+  # filter out uninteresting proteins
+  filter(!grepl(paste(exclude, collapse = "|"),
+                Description, ignore.case = TRUE)) %>%
+  identify_deregulated_proteins(FC = 2, cutoff = 40, min_present = 30)
+```
+Look at overexpression statistics when including both of the above comparisons:
+```{r}
+putative_degraders <- topTable(fit,
+                               number = Inf,
+                               coef = grep("[OM]_vs_[FQDG]_t|[NP]_vs_[FQHE]_t",
+                                           colnames(fit$coefficients)),
+         lfc = 0.5) %>%
+  select(Protein.ID, Description, Organism, adj.P.Val, matches("_vs_")) %>%
+  # filter out uninteresting proteins
+  filter(!grepl(paste(exclude, collapse = "|"),
+                Description, ignore.case = TRUE)) %>%
+  # count number of overexpression per protein
+  identify_deregulated_proteins(FC = 2, cutoff = 50, min_present = 30)
+putative_degraders %T>%
+  # Export to csv
+  rio::export(here(limma_dir, "putative_degraders.csv"))
+```
+Are these proteins significantly overexpressed in the respective conditions?
+```{r}
+# extract Protein.IDs from putative plastic degraders
+names <- putative_degraders$Protein.ID
+contrasts <- putative_degraders %>%
+  select(matches("_vs_")) %>%
+  colnames()
+
+putative_degraders_stats <- extract_pvalue(results, contrasts, names) 
+putative_degraders_stats %>%
+  filter(P.Value < 0.05) %>%
+  arrange(adj.P.Val)
+```
+Are these proteins also present in condition J?
+J is the third most effective condition in terms of PBAT degradation, but no results were found for this condition when including it in the analysis above.
+```{r}
+eset %>%
+  exprs %>%
+  as.data.frame() %>%
+  select(matches("[JNP]_t")) %>%
+  rownames_to_column(var = "Protein.ID") %>%
+  filter(Protein.ID %in% putative_degraders$Protein.ID)
+```
+##### Influence of Jasmonate
+Are proteins up- or downregulated in the presence of jasmonate?
+```{r jasmonate upregulation}
+contrasts <- c("K_vs_G", "O_vs_M", "I_vs_D", "P_vs_N", "L_vs_H", "J_vs_E", "Q_vs_F")
+top_proteins <- topTable(fit,
+                         number = Inf,
+                         coef = grep(paste(contrasts, collapse = "|"),
+                                     colnames(fit$coefficients)),
+                         lfc = 1) %>% 
+  select(Protein.ID, Description, adj.P.Val ,matches("_vs_"))
+plot_heatmap(top_proteins,
+             annotation = c("TIME", "WORM", "PLASTIC"),
+             treeheight_row = 0) %T>%
+  save_pheatmap_png(.,filename = here(limma_dir, "plots", "HM_jasmonate.png"),
+                    width = 16, height = 9, res = 300)
+# Create table with the number of deregulated proteins
+count_deregulated_proteins(top_proteins)
+count_deregulated_proteins(top_proteins) %>%
+  summarise_all(sum)
+# Look at upredulated proteins
+identify_deregulated_proteins(top_proteins, FC=2, cutoff = 50, min_present=40)
+# Look at downregulated proteins
+identify_deregulated_proteins(top_proteins, cutoff = 40, FC = 1,
+                              min_present = 40, DE = "down") 
+```
+```{r volcano_plots_jasmonate}
+# Create volcano plots for PBAT conditions comparing time points
+names <- contrasts %>%
+  paste(collapse = "|") %>%
+  grep(., colnames(fit$coefficients), value = TRUE)
+volcano_plots_jasmonate <- purrr::map(names, ~plot_volcano(results, .x)) %>%
+  set_names(names)
+purrr::walk(volcano_plots_jasmonate, print)
+```
+##### Plastic vs. no plastic
+```{r }
+contrasts <- c("[GH]_vs_B_t[1-5]", "[KL]_vs_B_t[1-5]",
+               "[MN]_vs_F_t[1-5]", "[OP]_vs_Q_t[1-5]")
+top_proteins <- topTable(fit,
+                         number = Inf,
+                         coef = grep(paste(contrasts, collapse = "|"),
+                                     colnames(fit$coefficients)),
+                         lfc = 0.5) %>% 
+  select(Protein.ID, Description, Organism, adj.P.Val ,matches("_vs_"))
+
+plot_heatmap(top_proteins,
+             annotation = c("TIME", "PLASTIC", "WORM", "JASMONATE"),
+             FC = 2,
+             title = "Plastic vs no plastic")
+
+# Create table with the number of deregulated proteins
+count_deregulated_proteins(top_proteins, FC = 0)
+count_deregulated_proteins(top_proteins, FC = 0) %>%
+  summarise_all(sum)
+# Identify proteins that are upregulated
+identify_deregulated_proteins(top_proteins, FC = 2, cutoff = 50, min_present = 40)
+# Identify downregulated proteins
+identify_deregulated_proteins(top_proteins, FC = 2, cutoff = 50,
+                              min_present = 40, DE = "down")
+```
+
+##### Dry worm vs dry worm blank
+
+```{r dry_worm_vs_blank}
+top_proteins <- topTable(fit,
+                         number = Inf,
+                         coef = grep("[GHKL]_vs_B_t[0-5]",
+                                     colnames(fit$coefficients))) %>% 
+  select(Protein.ID, Description, adj.P.Val ,matches("_vs_"))
+
+plot_heatmap(top_proteins,
+             annotation = c("TIME", "PLASTIC", "JASMONATE"),
+             FC = 2,
+             treeheight_row = 0)
+
+# Create table with the number of deregulated proteins
+count_deregulated_proteins(top_proteins, FC = 2)
+# make table of most overexpressed proteins in dry worm samples
+identify_deregulated_proteins(top_proteins,FC = 2, cutoff = 40, min_present = 40)
+```
+```{r volcano_plots_dryworm}
+# Create volcano plots for PBAT conditions comparing time points
+names <- grep("[GHKL]_vs_B_t[0-5]", colnames(fit$coefficients), value = TRUE)
+volcano_plots_dryworm <- purrr::map(names, ~plot_volcano(results, .x)) %>%
+  set_names(names)
+purrr::walk(volcano_plots_dryworm, print)
+```
+##### Live worm vs live worm blank
+Look at all live worm conditions (M, N, O, P) against the live worm blanks (F, Q):
+```{r live_worm_vs_blank}
+contrasts <- c("[MN]_vs_F_t[1-5]", "[OP]_vs_Q_t[1-5]")
+top_proteins <- topTable(fit,
+                         number = Inf,
+                         coef = grep(paste(contrasts, collapse = "|"),
+                                     colnames(fit$coefficients))) %>% 
+  select(Protein.ID, Description, adj.P.Val ,matches("_vs_"))
+
+plot_heatmap(top_proteins,
+             annotation = c("TIME", "PLASTIC", "JASMONATE"),
+             FC = 2,
+             treeheight_row = 0)
+# Create table with the number of deregulated proteins
+count_deregulated_proteins(top_proteins, FC = 2)
+# make table of most overexpressed proteins in dry worm samples
+identify_deregulated_proteins(top_proteins, FC = 2, cutoff = 50, min_present = 40)
+```
+```{r volcano_plots_liveworm}
+# Create volcano plots for PBAT conditions comparing time points
+names <- grep("[MN]_vs_F_t[1-5]|[OP]_vs_Q_t[1-5]", colnames(fit$coefficients), value = TRUE)
+volcano_plots_liveworm <- purrr::map(names, ~plot_volcano(results, .x)) %>%
+  set_names(names)
+purrr::walk(volcano_plots_liveworm, print)
+```
+##### Non-worm containing vs water blank
+Look at conditions containing plastic but no worm (D, E, I, J) vs the water blanks (A and C):
+```{r worm free vs water blank}
+contrasts <- c("[DE]_vs_A_t[1-5]", "[IJ]_vs_C_t[1-5]")
+top_proteins <- topTable(fit,
+                         number = Inf,
+                         coef = grep(paste(contrasts, collapse = "|"),
+                                     colnames(fit$coefficients))) %>% 
+  select(Protein.ID, Description, Organism, adj.P.Val ,matches("_vs_"))
+
+plot_heatmap(top_proteins,
+             annotation = c("TIME", "PLASTIC", "JASMONATE"),
+             FC = 2,
+             treeheight_row = 0)
+# Create table with the number of deregulated proteins
+count_deregulated_proteins(top_proteins, FC = 2)
+# make table of most overexpressed proteins in dry worm samples
+identify_deregulated_proteins(top_proteins, FC = 2, cutoff = 30, min_present = 30)
+```
+```{r volcano_plots_noworm}
+# Create volcano plots for PBAT conditions comparing time points
+names <- grep("[DE]_vs_A_t[1-5]|[IJ]_vs_C_t[1-5]", colnames(fit$coefficients), value = TRUE)
+volcano_plots_noworm <- purrr::map(names, ~plot_volcano(results, .x)) %>%
+  set_names(names)
+purrr::walk(volcano_plots_noworm, print)
+```
+### Homology search
+```{r}
+# create directory for blast and hmmer results
+blast_dir <- here(data_dir, "04_blast")
+dir.create(blast_dir, showWarnings = FALSE)
+hmmer_dir <- here(data_dir, "05_hmmer")
+dir.create(hmmer_dir, showWarnings = FALSE)
+```
+```{r extract protein sequences}
+# extract protein sequences of interest from the FragPipe database
+# make bash run in interactive mode
+bash <- "bash -i -c"
+# command for running the python script
+# wslpath is used to convert Windows paths to WSL-compatible paths
+command <- str_glue("python scripts/extract_sequences.py",
+                    "-i data/prot_db/2024-01-24-decoys-ec_3_AND_rev_nep_sar_ten_2023_10_16_contam.fasta.fas",
+                    "-q $(wslpath -a {limma_dir}/putative_degraders.csv)",
+                    "> $(wslpath -a {limma_dir}/putative_degraders.fasta)",
+                    .sep = " ")
+# run the command
+system(paste(bash, shQuote(command)))
+```
+```{r make blast db}
+# activate conda environment
+conda <- "conda activate thesis"
+# command to create blast database
+command <- str_glue("makeblastdb",
+                    "-in data/blast/plastic_degraders.fasta",
+                    "-dbtype prot",
+                    "-out data/blast/blast_db",
+                    .sep = " ")
+
+full_command <- paste(conda, command, sep = " && ")
+# run command
+system(paste(bash, shQuote(full_command)))
+```
+```{r}
+# command for running bastp
+command <- str_glue("blastp",
+                    "-query $(wslpath -a {limma_dir}/putative_degraders.fasta)",
+                    "-db data/blast/blast_db",
+                    "-max_target_seqs 6",
+                    "-outfmt 6",
+                    "-out $(wslpath -a {blast_dir}/blast_results.txt)",
+                    .sep = " ")
+
+full_command <- paste(conda, command, sep = " && ")
+# run command
+system(paste(bash, shQuote(full_command)))
+```
+```{r analyse blast results}
+# read in blast results
+blast_results <- rio::import(here(blast_dir, "blast_results.txt"))
+
+# Add column names of blast format 6
+colnames(blast_results) <- c("qseqid", "sseqid", "pident",
+                             "length", "mismatch", "gapopen",
+                             "qstart", "qend", "sstart",
+                             "send", "evalue", "bitscore")
+
+blast_results <- blast_results %>%
+  # extract query and subject id from qseqid/sseqid string
+  mutate(qseqid = str_split_i(qseqid, "\\|", -2),
+         sseqid = str_split_i(sseqid, "\\|", -2)) %>%
+  left_join(top_proteins_PET, by = c("qseqid" = "Protein.ID")) %>%
+  select(!matches("_vs_"), -adj.P.Val)
+```
+```{r}
+# read in protein database of degrading enzymes for metadata
+# Function to parse headers
+parse_header <- function(header) {
+  # Uniprot headers
+  if (str_starts(header, ">sp")) {
+    parts <- str_split(header, "\\|", simplify = TRUE)
+    sseqid <- parts[2]
+    Description_Organism <- parts[3]
+    
+    # Extract description
+    Description_t <- str_split_i(Description_Organism, " OS=", 1)
+
+    # Extract Organism
+    Organism_t <- str_split_i(Description_Organism, " OS=", 2) %>%
+      str_split_i(., " OX=", 1)
+  } else {
+    # PDB headers
+    parts <- str_split(header, "\\|", simplify = TRUE)
+    sseqid <- str_replace(parts[1], ">", "")
+    Description_t <- parts[3]
+    Organism_t <- str_extract(parts[4], "^[^\\(]+")
+  }
+  data.frame(sseqid, Description_t, Organism_t)
+}
+
+# Apply the function to all headers
+palstic_degraders <- read.delim(here("data/blast/plastic_degraders.fasta"),
+                                header = FALSE) %>%
+  filter(grepl("^>", V1)) %>%
+  rowwise() %>%
+  mutate(parsed = list(parse_header(V1))) %>%
+  unnest(cols = c(parsed)) %>%
+  select(-V1)
+
+blast_results %>%
+  left_join(., palstic_degraders, by = "sseqid")
+```
+## Session info
+```{r session info, eval = TRUE}
+sessionInfo()
+```

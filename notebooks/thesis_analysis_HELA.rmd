@@ -1,0 +1,143 @@
+---
+title: "Master's Thesis: Analysis of HELA control"
+author: "Sebastian Gritsch"
+date: "2023-11-14"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+```
+
+```{r initialize_project}
+here::i_am("notebooks/analysis_HELA.rmd")
+```
+
+```{r load libraries}
+library(here)
+library(tidyverse)
+library(Biobase)
+library(magrittr)
+library(limma)
+library(pheatmap)
+library(ggfortify)
+library(EnhancedVolcano)
+```
+
+### Explore FragPipe output
+
+```{r load data}
+data_dir <- here("results/HELA")
+
+fragpipe_dir <- here(data_dir, "00_fragpipe")
+
+# create directory for results
+explore_dir <- here(data_dir, "01_exploration")
+dir.create(explore_dir, showWarnings = FALSE)
+
+# Import fragpipe results
+data <- rio::import(here(fragpipe_dir, "combined_protein.tsv")) %>%
+  # make column names tidy
+  rename_with(make.names)
+
+
+# Import metadata
+metadata <- rio::import(here("data/conditions_metadata.csv"))
+
+```
+
+#### Explore difference between Intensity and MaxLFQ Intensity
+
+```{r}
+# Extract Intensities from the data
+data_int <- data %>%
+  # filter out contaminating proteins from cRAP database and trypsin
+  filter(!grepl("cRAP[0-9]{3}", Protein)) %>%
+  filter(!grepl("cRAP[0-9]{3}", Indistinguishable.Proteins)) %>%
+  filter(!grepl("TRY", Entry.Name)) %>%
+  # filter rows without Protein ID
+  filter(!is.na(Protein.ID)) %>%
+  # set Protein.ID as rownames
+  column_to_rownames("Protein.ID") %>%
+  # select columns with Intensities
+  select(ends_with("Intensity"), -contains("MaxLFQ")) %>%
+  # Remove 'Intensity' from column names
+  set_colnames(., str_replace(colnames(.), ".Intensity", "")) %>%
+  log2() %>%
+  # convert -Inf to NA
+  mutate_all(~ifelse(. == -Inf, NA, .))
+
+# are there samples with only NA values?
+data_int %>%
+  select(where(~all(is.na(.)))) %>%
+  colnames()
+
+# Remove samples with only NA values
+data_int <- data_int %>%
+  select(where(~!all(is.na(.))))
+
+
+
+# Extract MaxLFQ intensities from the data
+data_MaxLFQ <- data %>%
+  # filter out contaminating proteins from cRAP database
+  filter(!grepl("cRAP[0-9]{3}", Protein)) %>%
+  filter(!grepl("cRAP[0-9]{3}", Indistinguishable.Proteins)) %>%
+  filter(!grepl("TRY", Entry.Name)) %>%
+  # filter rows without Protein ID
+  filter(!is.na(Protein.ID)) %>%
+  # set Protein.ID as rownames
+  column_to_rownames("Protein.ID") %>%
+  # select columns with MaxLFQ intensities
+  select(ends_with("MaxLFQ.Intensity")) %>%
+  # Remove 'Intensity' from column names
+  set_colnames(., str_replace(colnames(.), ".MaxLFQ.Intensity", "")) %>%
+  log2() %>%
+  # convert -Inf to NA
+  mutate_all(~ifelse(. == -Inf, NA, .))
+
+# are there samples with only NA values?
+data_MaxLFQ %>%
+  select(where(~all(is.na(.)))) %>%
+  colnames()
+
+# Remove samples with only NA values
+data_MaxLFQ <- data_MaxLFQ %>%
+  select(where(~!all(is.na(.))))
+
+
+# Summary table of detected proteins when using Intensity and MaxLFQ Intensity
+data.frame(row.names = c("Intensity", "MaxLFQ Intensity"),
+           # Number of identified proteins
+           Num_proteins = c(nrow(data_int), nrow(data_MaxLFQ)),
+           # Number of detected proteins across all samples
+           Detected = c(sum(data_int > 0, na.rm = TRUE),
+                        sum(data_MaxLFQ > 0, na.rm = TRUE)),
+           # Missing values across all values
+           Missing = c(sum(is.na(data_int)),
+                       sum(is.na(data_MaxLFQ))))
+```
+
+#### Number of proteins identified
+
+```{r}
+# boxplot of number of proteins per sample
+(data_int %>%
+  summarize_all(~sum(!is.na(.))) %>%
+  pivot_longer(everything(), names_to = "SAMPLEID", values_to = "num_proteins") %>%
+  ggplot(.)+
+   geom_boxplot(aes(y = num_proteins)) 
+  ) %T>%
+  ggsave(plot = ., filename = here(explore_dir, "HELA_no_proteins.png"),
+         width = 4, height = 8, units = "cm", dpi = 300)
+
+# Summary of number of proteins per sample
+data_int %>%
+  summarize_all(~sum(!is.na(.))) %>%
+  pivot_longer(everything(), names_to = "SAMPLEID", values_to = "num_proteins") %>%
+  select(num_proteins) %>%
+  summary()
+```
+
