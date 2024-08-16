@@ -1831,17 +1831,17 @@ purrr::walk(volcano_plots_noworm, print)
 # create directory for blast and hmmer results
 blast_dir <- here(data_dir, "04_blast")
 dir.create(blast_dir, showWarnings = FALSE)
-hmmer_dir <- here(data_dir, "05_hmmer")
-dir.create(hmmer_dir, showWarnings = FALSE)
 ```
 ```{r extract protein sequences}
 # extract protein sequences of interest from the FragPipe database
+scripts_dir <- here("scripts")
+protdb_dir <- here("data/prot_db")
 # make bash run in interactive mode
 bash <- "bash -i -c"
 # command for running the python script
 # wslpath is used to convert Windows paths to WSL-compatible paths
-command <- str_glue("python scripts/extract_sequences.py",
-                    "-i data/prot_db/2024-01-24-decoys-ec_3_AND_rev_nep_sar_ten_2023_10_16_contam.fasta.fas",
+command <- str_glue("python $(wslpath -a {scripts_dir}/extract_sequences.py)",
+                    "-i $(wslpath -a {protdb_dir}/2024-01-24-decoys-ec_3_AND_rev_nep_sar_ten_2023_10_16_contam.fasta.fas)",
                     "-q $(wslpath -a {limma_dir}/putative_degraders.csv)",
                     "> $(wslpath -a {limma_dir}/putative_degraders.fasta)",
                     .sep = " ")
@@ -1849,13 +1849,14 @@ command <- str_glue("python scripts/extract_sequences.py",
 system(paste(bash, shQuote(command)))
 ```
 ```{r make blast db}
+blastdb_dir <- here("data/blast")
 # activate conda environment
 conda <- "conda activate thesis"
 # command to create blast database
 command <- str_glue("makeblastdb",
-                    "-in data/blast/plastic_degraders.fasta",
+                    "-in $(wslpath -a {blastdb_dir}/plastic_degraders.fasta)",
                     "-dbtype prot",
-                    "-out data/blast/blast_db",
+                    "-out $(wslpath -a {blastdb_dir}/blast_db)",
                     .sep = " ")
 
 full_command <- paste(conda, command, sep = " && ")
@@ -1866,7 +1867,7 @@ system(paste(bash, shQuote(full_command)))
 # command for running bastp
 command <- str_glue("blastp",
                     "-query $(wslpath -a {limma_dir}/putative_degraders.fasta)",
-                    "-db data/blast/blast_db",
+                    "-db $(wslpath -a {blastdb_dir}/blast_db)",
                     "-max_target_seqs 6",
                     "-outfmt 6",
                     "-out $(wslpath -a {blast_dir}/blast_results.txt)",
